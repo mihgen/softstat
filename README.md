@@ -15,8 +15,8 @@ go build softstat.go
 ```
 
 #### How it works
-This utility will go over all processes in /proc, get their cmd name from /proc/<pid>/status, and count number of open file descriptors from /proc/<pid>/fd/. prlimit64() system call is used to get limits set for the process, and SoftLimit value is used in calculations.
+This utility will go over all processes in /proc, get their cmd name from /proc/\<pid\>/status, and count number of open file descriptors from /proc/\<pid\>/fd/. prlimit64() system call is used to get limits set for the process, and SoftLimit value is used in calculations.
 
-Use *prlimit* Linux utility if you need to get or change limits of running process. Alternatively, /proc/<pid>/limits can be used to get current limits.
+Use *prlimit* Linux utility if you need to get or change limits of running process. Alternatively, /proc/\<pid\>/limits can be used to get current limits.
 
 Note, that currently *softstat* only works on x86_64 Linux.
