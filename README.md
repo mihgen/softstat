@@ -7,6 +7,10 @@ Make sure you run this utility under root (it needs access to /proc).
 # Build binary
 go build softstat.go
 
+# Alternatively, download already compiled version
+wget https://github.com/mihgen/softstat/releases/download/0.1/softstat
+chmod +x softstat
+
 # Show 10 mostly loaded processes
 ./softstat
 
