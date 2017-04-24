@@ -15,9 +15,9 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -99,19 +99,11 @@ func GetStackSize(pid string) uint64 {
 }
 
 func CmdName(pid string) string {
-	statusFile, err := os.Open(filepath.Join("/proc/", pid, "/status"))
+	data, err := ioutil.ReadFile(filepath.Join("/proc", pid, "comm"))
 	if err != nil {
 		panic(err)
 	}
-	defer statusFile.Close()
-	stScan := bufio.NewScanner(statusFile)
-	stScan.Scan()
-	parsed := strings.Fields(stScan.Text())
-	if len(parsed) != 2 {
-		panic("Can't parse cmdname for pid=" + pid)
-	}
-
-	return parsed[1]
+	return strings.TrimSuffix(string(data), "\n")
 }
 
 func main() {
