@@ -1,4 +1,4 @@
-## Report file descriptors usage information
+## Report file descriptors, processes count vs limits
 
 #### Example usage
 Make sure you run this utility under root (it needs access to /proc).
@@ -19,6 +19,22 @@ chmod +x softstat
 
 # Show all
 ./softstat -n -1
+```
+
+#### Example output
+```bash
+./softstat
+  PID FD FD-max FD% Proc Proc-Max Proc%         CMD
+    1 52  65536 0.1  126      500  25.2     systemd
+ 6615  4   1024 0.4  126      500  25.2    softstat
+ 5379  4   1024 0.4  126      500  25.2        bash
+ 5378  4   1024 0.4  126      500  25.2          su
+ 5234  4   1024 0.4  126      500  25.2        bash
+ 5233  4   1024 0.4  126      500  25.2          su
+ 5178  5   1024 0.5  126      500  25.2        sshd
+ 6597  3   1024 0.3  126      500  25.2          go
+  132  0   1024 0.0  126     5843   2.2      bioset
+    9  0   1024 0.0  126     5843   2.2 migration/0
 ```
 
 #### How it works
