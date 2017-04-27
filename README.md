@@ -18,7 +18,7 @@ chmod +x softstat
 ./softstat -n 1000
 
 # Show all
-./softstat -n -1
+./softstat -1
 ```
 
 #### Example output

@@ -60,7 +60,8 @@ func Prlimit(pid int, resource int, new_rlim *syscall.Rlimit, old_rlim *syscall.
 	return
 }
 
-type ByFdsPercent []OutputEntry
+// interface for sorting
+type ByPercent []OutputEntry
 
 func max(p1, p2 float32) float32 {
 	if p1 < p2 {
@@ -69,89 +70,97 @@ func max(p1, p2 float32) float32 {
 	return p1
 }
 
-func (p ByFdsPercent) Len() int { return len(p) }
-func (p ByFdsPercent) Less(i, j int) bool {
+func (p ByPercent) Len() int { return len(p) }
+func (p ByPercent) Less(i, j int) bool {
 	return max(p[i].fdsPercent, p[i].nProcPercent) < max(p[j].fdsPercent, p[j].nProcPercent)
 }
-func (p ByFdsPercent) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
+func (p ByPercent) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
 
-func GetLimits(pid string) Limits {
+func GetLimits(pid string) (Limits, error) {
 	var mylimit Limits
 	var rlim syscall.Rlimit
 	pidNu, _ := strconv.Atoi(pid)
 
 	err := Prlimit(pidNu, syscall.RLIMIT_NOFILE, nil, &rlim)
-	if err != nil {
-		panic(err)
-	}
-
 	mylimit.openFiles = rlim
+	if err != nil {
+		return mylimit, err
+	}
 
 	// syscall.RLIMIT_NPROC is not defined, using number instead
 	// See https://github.com/golang/go/issues/14854 for details
 	err = Prlimit(pidNu, 6, nil, &rlim)
-	if err != nil {
-		panic(err)
-	}
 	mylimit.nProc = rlim
-	return mylimit
+	if err != nil {
+		return mylimit, err
+	}
+	return mylimit, nil
 }
 
-func countFiles(dir string) uint64 {
+func countFiles(dir string) (uint64, error) {
 	f, err := os.Open(dir)
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
 	defer f.Close()
 	files, err := f.Readdirnames(-1)
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
-	return uint64(len(files))
+	return uint64(len(files)), nil
 }
 
-func GetFdOpen(pid string) uint64 {
+func GetFdOpen(pid string) (uint64, error) {
 	return countFiles(filepath.Join("/proc", pid, "fd"))
 }
 
-func GetNProcPerUid(pid string) uint64 {
-	// we actually need number of processes ran by this PID's UID
-	uid, _ := getStatus(pid)
-	return uint64(UserProcs[uid])
-}
-
-func CmdName(pid string) string {
-	data, err := ioutil.ReadFile(filepath.Join("/proc", pid, "comm"))
-	if err != nil {
-		panic(err)
-	}
-	return strings.TrimSuffix(string(data), "\n")
-}
-
-func getStatus(pid string) (uid string, threads uint64) {
+func getStatus(pid string) (uid string, threads uint64, err error) {
 	data, err := ioutil.ReadFile(filepath.Join("/proc", pid, "status"))
 	if err != nil {
-		panic(err)
+		// we can't do anything for this pid. It may not exist anymore, or we don't have enough capabilities
+		return
 	}
 	str := string(data)
 
 	reUid := regexp.MustCompile(`(?m:^Uid:[ \t]+([0-9]+)[ \t]+)`)
 	matchedUid := reUid.FindStringSubmatch(str)
+	// TODO: what if we can't parse? Need to do error-handling
 	uid = matchedUid[1]
 
 	reThreads := regexp.MustCompile(`(?m:^Threads:[ \t]+([0-9]+))`)
 	matchedThreads := reThreads.FindStringSubmatch(str)
+	// TODO: what if we can't parse? Need to do error-handling
 	threads, err = strconv.ParseUint(matchedThreads[1], 10, 64)
+	return
+}
+
+func GetNProcPerUid(pid string) (uint64, error) {
+	// we actually need number of processes ran by this PID's UID
+	uid, _, err := getStatus(pid)
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
-	return uid, threads
+	return uint64(UserProcs[uid]), nil
+}
+
+func CmdName(pid string) (string, error) {
+	data, err := ioutil.ReadFile(filepath.Join("/proc", pid, "comm"))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(string(data), "\n"), nil
 }
 
 func countProcesses(pids []string) {
 	UserProcs = make(map[string]uint64)
 	for _, pid := range pids {
-		uid, threads := getStatus(pid)
+		uid, threads, err := getStatus(pid)
+		if err != nil {
+			// process may no longer exist, so we just skip pid with errors
+			// TODO: need to have better error handling here.
+			// One of issues could be that we simply can't open any file, as we reached FD limit ourselves.
+			continue
+		}
 		UserProcs[uid] += threads
 		TotalThreads += threads
 	}
@@ -160,6 +169,7 @@ func countProcesses(pids []string) {
 func ProcTotalLimit() uint64 {
 	data, err := ioutil.ReadFile("/proc/sys/kernel/threads-max")
 	if err != nil {
+		// we are in a big trouble if we can't get threads-max, so just panic right away
 		panic(err)
 	}
 	threadsMax, err := strconv.ParseUint(strings.TrimSuffix(string(data), "\n"), 10, 64)
@@ -171,8 +181,13 @@ func ProcTotalLimit() uint64 {
 }
 
 func main() {
-	nLines := flag.Int("n", 10, "Output N most loaded processes. Use -1 to list all.")
-	flag.Parse()
+	var nLines int
+	if len(os.Args) == 2 && os.Args[1] == "-1" {
+		nLines = -1
+	} else {
+		flag.IntVar(&nLines, "n", 10, "Output N most loaded processes. Use -1 to list all.")
+		flag.Parse()
+	}
 	procs, err := filepath.Glob("/proc/[0-9]*")
 	if err != nil {
 		panic(err)
@@ -194,8 +209,14 @@ func main() {
 	pp1 := float32(TotalThreads) / float32(ProcTotalLimit()) * 100.0
 
 	for _, pid := range pids {
-		limits := GetLimits(pid)
-		open := GetFdOpen(pid)
+		limits, err := GetLimits(pid)
+		if err != nil {
+			continue // this process may no longer exist. So let's skip it.
+		}
+		open, err := GetFdOpen(pid)
+		if err != nil {
+			continue // this process may no longer exist. So let's skip it.
+		}
 		fdsLimit := strconv.FormatUint(limits.openFiles.Cur, 10)
 		fdsPercent := float32(open) / float32(limits.openFiles.Cur) * 100.0
 		if fdsPercent > 100 {
@@ -205,7 +226,10 @@ func main() {
 			fdsLimit = "-1"
 		}
 
-		nProc := GetNProcPerUid(pid)
+		nProc, err := GetNProcPerUid(pid)
+		if err != nil {
+			continue // this process may no longer exist. So let's skip it.
+		}
 		pp2 := float32(nProc) / float32(limits.nProc.Cur) * 100.0
 
 		var pp float32   // process percentage
@@ -231,9 +255,14 @@ func main() {
 			plStr = strconv.FormatUint(pl, 10)
 		}
 
+		cmd, err := CmdName(pid)
+		if err != nil {
+			continue // this process may no longer exist. So let's skip it.
+		}
+
 		entries = append(entries, OutputEntry{
 			pid:          pid,
-			cmd:          CmdName(pid),
+			cmd:          cmd,
 			fds:          open,
 			fdsLimit:     fdsLimit,
 			fdsPercent:   fdsPercent,
@@ -242,12 +271,12 @@ func main() {
 			nProcPercent: pp,
 		})
 	}
-	sort.Sort(sort.Reverse(ByFdsPercent(entries)))
+	sort.Sort(sort.Reverse(ByPercent(entries)))
 
-	if *nLines == -1 {
-		*nLines = len(entries)
+	if nLines == -1 {
+		nLines = len(entries)
 	}
-	for i := 0; i < *nLines && i < len(entries); i++ {
+	for i := 0; i < nLines && i < len(entries); i++ {
 		e := entries[i]
 		fmt.Fprintf(w, "%s\t%d\t%s\t%2.1f\t%d\t%s\t%2.1f\t%s\t\n", e.pid, e.fds, e.fdsLimit, e.fdsPercent, e.nProc, e.nProcLimit, e.nProcPercent, e.cmd)
 	}
