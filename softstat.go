@@ -60,21 +60,12 @@ func Prlimit(pid int, resource int, new_rlim *syscall.Rlimit, old_rlim *syscall.
 	return
 }
 
-// interface for sorting
-type ByPercent []OutputEntry
-
 func max(p1, p2 float32) float32 {
 	if p1 < p2 {
 		return p2
 	}
 	return p1
 }
-
-func (p ByPercent) Len() int { return len(p) }
-func (p ByPercent) Less(i, j int) bool {
-	return max(p[i].fdsPercent, p[i].nProcPercent) < max(p[j].fdsPercent, p[j].nProcPercent)
-}
-func (p ByPercent) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
 
 func GetLimits(pid string) (Limits, error) {
 	var mylimit Limits
@@ -200,8 +191,8 @@ func main() {
 	// count number of processes per user
 	countProcesses(pids)
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(w, "PID\tFD\tFD-max\tFD%\tProc\tProc-Max\tProc%\tCMD\t")
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 0, ' ', tabwriter.AlignRight)
+	fmt.Fprintln(w, "PID\t FD\t FD-max\t FD%\t Proc\t Proc-Max\t Proc%\t CMD\t")
 
 	entries := []OutputEntry{}
 
@@ -271,14 +262,19 @@ func main() {
 			nProcPercent: pp,
 		})
 	}
-	sort.Sort(sort.Reverse(ByPercent(entries)))
+
+	f := func(i, j int) bool {
+		return max(entries[i].fdsPercent, entries[i].nProcPercent) > max(entries[j].fdsPercent, entries[j].nProcPercent)
+	}
+	sort.Slice(entries, f)
 
 	if nLines == -1 {
 		nLines = len(entries)
 	}
 	for i := 0; i < nLines && i < len(entries); i++ {
 		e := entries[i]
-		fmt.Fprintf(w, "%s\t%d\t%s\t%2.1f\t%d\t%s\t%2.1f\t%s\t\n", e.pid, e.fds, e.fdsLimit, e.fdsPercent, e.nProc, e.nProcLimit, e.nProcPercent, e.cmd)
+		fmt.Fprintf(w, "%s\t %d\t %s\t %2.1f\t %d\t %s\t %2.1f\t %s\t\n",
+			e.pid, e.fds, e.fdsLimit, e.fdsPercent, e.nProc, e.nProcLimit, e.nProcPercent, e.cmd)
 	}
 	if err = w.Flush(); err != nil {
 		panic(err)
