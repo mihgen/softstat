@@ -31,7 +31,7 @@ import (
 )
 
 var UserProcs map[string]uint64
-var TotalThreads uint64
+var TotalTasks uint64
 
 type Limits struct {
 	openFiles syscall.Rlimit
@@ -43,10 +43,10 @@ type OutputEntry struct {
 	cmd          string
 	fds          uint64
 	fdsLimit     string
-	fdsPercent   float32
+	fdsPercent   float64
 	nProc        uint64
 	nProcLimit   string
-	nProcPercent float32
+	nProcPercent float64
 }
 
 func Prlimit(pid int, resource int, new_rlim *syscall.Rlimit, old_rlim *syscall.Rlimit) (err error) {
@@ -60,11 +60,11 @@ func Prlimit(pid int, resource int, new_rlim *syscall.Rlimit, old_rlim *syscall.
 	return
 }
 
-func max(p1, p2 float32) float32 {
+func min(p1, p2 uint64) uint64 {
 	if p1 < p2 {
-		return p2
+		return p1
 	}
-	return p1
+	return p2
 }
 
 func GetLimits(pid string) (Limits, error) {
@@ -153,7 +153,7 @@ func countProcesses(pids []string) {
 			continue
 		}
 		UserProcs[uid] += threads
-		TotalThreads += threads
+		TotalTasks += threads
 	}
 }
 
@@ -169,6 +169,37 @@ func ProcTotalLimit() uint64 {
 		panic(err)
 	}
 	return threadsMax
+}
+
+func FileNr() (used, max uint64) {
+	data, err := ioutil.ReadFile("/proc/sys/fs/file-nr")
+	if err != nil {
+		panic(err)
+	}
+	str := strings.TrimSuffix(string(data), "\n")
+	parsed := strings.Split(str, "\t")
+
+	used, err = strconv.ParseUint(parsed[0], 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	max, err = strconv.ParseUint(parsed[2], 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func FilePerProcMax() uint64 {
+	data, err := ioutil.ReadFile("/proc/sys/fs/nr_open")
+	if err != nil {
+		panic(err)
+	}
+	x, err := strconv.ParseUint(strings.TrimSuffix(string(data), "\n"), 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	return x
 }
 
 func main() {
@@ -190,14 +221,16 @@ func main() {
 
 	// count number of processes per user
 	countProcesses(pids)
+	fmt.Printf("Tasks %d, system max is %d\n", TotalTasks, ProcTotalLimit())
+
+	fileTotal, fileMax := FileNr()
+	filePerProcMax := FilePerProcMax()
+	fmt.Printf("File descriptors open %d, system max total is %d, system max per process is %d\n", fileTotal, fileMax, filePerProcMax)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 0, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(w, "PID\t FD\t FD-max\t FD%\t Proc\t Proc-Max\t Proc%\t CMD\t")
+	fmt.Fprintln(w, "PID\t FD\t FD-Rlim\t FD%\t Task\t Pr-Rlim\t Task%\t CMD\t")
 
 	entries := []OutputEntry{}
-
-	// Limits for total number of processes.
-	pp1 := float32(TotalThreads) / float32(ProcTotalLimit()) * 100.0
 
 	for _, pid := range pids {
 		limits, err := GetLimits(pid)
@@ -208,42 +241,33 @@ func main() {
 		if err != nil {
 			continue // this process may no longer exist. So let's skip it.
 		}
-		fdsLimit := strconv.FormatUint(limits.openFiles.Cur, 10)
-		fdsPercent := float32(open) / float32(limits.openFiles.Cur) * 100.0
+
+		fdsMaxPerProc := min(min(limits.openFiles.Cur, fileMax), filePerProcMax)
+		fdsPercent := float64(open) / float64(fdsMaxPerProc) * 100.0
 		if fdsPercent > 100 {
 			fdsPercent = 100
 		}
-		if limits.openFiles.Cur == math.MaxUint64 {
-			fdsLimit = "-1"
+
+		fdsLimit := "-1"
+		if limits.openFiles.Cur != math.MaxUint64 {
+			fdsLimit = strconv.FormatUint(limits.openFiles.Cur, 10)
 		}
 
 		nProc, err := GetNProcPerUid(pid)
 		if err != nil {
 			continue // this process may no longer exist. So let's skip it.
 		}
-		pp2 := float32(nProc) / float32(limits.nProc.Cur) * 100.0
-
-		var pp float32   // process percentage
-		var p, pl uint64 // process count, process limit
-		// TODO: we need to check not just for uid=0, but also for CAP_SYS_RESOURCE & CAP_SYS_ADMIN
-		// http://lxr.free-electrons.com/source/kernel/fork.c#L1529
-		if pp2 > pp1 && pid != "0" {
-			pp = pp2
-			p = nProc
-			pl = limits.nProc.Cur
-		} else {
-			pp = pp1
-			p = TotalThreads
-			pl = ProcTotalLimit()
-		}
+		nProcLimit := min(limits.nProc.Cur, ProcTotalLimit())
+		pp := float64(nProc) / float64(nProcLimit) * 100.0
 		if pp > 100 {
 			pp = 100
 		}
-		var plStr string
-		if pl == math.MaxUint64 {
-			plStr = "-1"
-		} else {
-			plStr = strconv.FormatUint(pl, 10)
+
+		// TODO: we need to check not just for uid=0, but also for CAP_SYS_RESOURCE & CAP_SYS_ADMIN
+		// http://lxr.free-electrons.com/source/kernel/fork.c#L1529
+		plStr := "-1"
+		if limits.nProc.Cur != math.MaxUint64 {
+			plStr = strconv.FormatUint(limits.nProc.Cur, 10)
 		}
 
 		cmd, err := CmdName(pid)
@@ -257,14 +281,14 @@ func main() {
 			fds:          open,
 			fdsLimit:     fdsLimit,
 			fdsPercent:   fdsPercent,
-			nProc:        p,
+			nProc:        nProc,
 			nProcLimit:   plStr,
 			nProcPercent: pp,
 		})
 	}
 
 	f := func(i, j int) bool {
-		return max(entries[i].fdsPercent, entries[i].nProcPercent) > max(entries[j].fdsPercent, entries[j].nProcPercent)
+		return math.Max(entries[i].fdsPercent, entries[i].nProcPercent) > math.Max(entries[j].fdsPercent, entries[j].nProcPercent)
 	}
 	sort.Slice(entries, f)
 
