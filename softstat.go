@@ -30,23 +30,45 @@ import (
 	"unsafe"
 )
 
-var UserProcs map[string]uint64
-var TotalTasks uint64
+type Metric struct {
+	name string
+	f    interface{}
+	res  Entry
+}
 
 type Limits struct {
 	openFiles syscall.Rlimit
 	nProc     syscall.Rlimit
 }
 
+type Entry struct {
+	v   uint64
+	max uint64
+}
+
+type Boundary struct {
+	by  string
+	v   uint64
+	max uint64
+	p   float64
+}
+
 type OutputEntry struct {
-	pid          string
-	cmd          string
-	fds          uint64
-	fdsLimit     string
-	fdsPercent   float64
-	nProc        uint64
-	nProcLimit   string
-	nProcPercent float64
+	pid   string
+	data  []Metric
+	bound Boundary
+	cmd   string
+}
+
+type Task struct {
+	pid    string
+	UidMap map[string]uint64
+	limits Limits
+}
+
+type Tasks struct {
+	pids  []Task
+	total uint64
 }
 
 func Prlimit(pid int, resource int, new_rlim *syscall.Rlimit, old_rlim *syscall.Rlimit) (err error) {
@@ -58,13 +80,6 @@ func Prlimit(pid int, resource int, new_rlim *syscall.Rlimit, old_rlim *syscall.
 		err = e1
 	}
 	return
-}
-
-func min(p1, p2 uint64) uint64 {
-	if p1 < p2 {
-		return p1
-	}
-	return p2
 }
 
 func GetLimits(pid string) (Limits, error) {
@@ -101,17 +116,47 @@ func countFiles(dir string) (uint64, error) {
 	return uint64(len(files)), nil
 }
 
-func GetFdOpen(pid string) (uint64, error) {
-	return countFiles(filepath.Join("/proc", pid, "fd"))
+func (t Task) FdsRlim() (Entry, error) {
+	v, err := countFiles(filepath.Join("/proc", t.pid, "fd"))
+	if err != nil {
+		return Entry{}, err // this process may no longer exist. So let's skip it.
+	}
+	return Entry{v, t.limits.openFiles.Cur}, nil
+}
+
+func (t Task) NprocRlim() (Entry, error) {
+	uid, _, err := getStatus(t.pid)
+	if err != nil {
+		return Entry{}, err
+	}
+	return Entry{t.UidMap[uid], t.limits.nProc.Cur}, nil
+}
+
+func CalcBound(m []Metric) (b Boundary) {
+	b.p = -1.0
+	for i := 0; i < len(m); i++ {
+		var p float64
+		if m[i].res.max <= 0 {
+			p = 100.0
+		} else {
+			p = 100.0 * float64(m[i].res.v) / float64(m[i].res.max)
+		}
+		if p > b.p {
+			b.p = p
+			b.by = m[i].name
+			b.v = m[i].res.v
+			b.max = m[i].res.max
+		}
+	}
+	return
 }
 
 func getStatus(pid string) (uid string, threads uint64, err error) {
-	data, err := ioutil.ReadFile(filepath.Join("/proc", pid, "status"))
+	str, err := ReadAndTrim(filepath.Join("/proc", pid, "status"))
 	if err != nil {
 		// we can't do anything for this pid. It may not exist anymore, or we don't have enough capabilities
 		return
 	}
-	str := string(data)
 
 	reUid := regexp.MustCompile(`(?m:^Uid:[ \t]+([0-9]+)[ \t]+)`)
 	matchedUid := reUid.FindStringSubmatch(str)
@@ -125,26 +170,30 @@ func getStatus(pid string) (uid string, threads uint64, err error) {
 	return
 }
 
-func GetNProcPerUid(pid string) (uint64, error) {
-	// we actually need number of processes ran by this PID's UID
-	uid, _, err := getStatus(pid)
+func ProcTotalLimit() uint64 {
+	str, err := ReadAndTrim("/proc/sys/kernel/threads-max")
 	if err != nil {
-		return 0, err
+		// we are in a big trouble if we can't get threads-max, so just panic right away
+		panic(err)
 	}
-	return uint64(UserProcs[uid]), nil
+	threadsMax, err := strconv.ParseUint(str, 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	return threadsMax
 }
 
-func CmdName(pid string) (string, error) {
-	data, err := ioutil.ReadFile(filepath.Join("/proc", pid, "comm"))
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSuffix(string(data), "\n"), nil
-}
+func TasksInit() *Tasks {
+	t := new(Tasks)
+	byUid := make(map[string]uint64)
 
-func countProcesses(pids []string) {
-	UserProcs = make(map[string]uint64)
-	for _, pid := range pids {
+	procs, err := filepath.Glob("/proc/[0-9]*")
+	if err != nil {
+		panic(err)
+	}
+	for _, p := range procs {
+		pid := strings.Split(p, "/")[2]
+
 		uid, threads, err := getStatus(pid)
 		if err != nil {
 			// process may no longer exist, so we just skip pid with errors
@@ -152,31 +201,34 @@ func countProcesses(pids []string) {
 			// One of issues could be that we simply can't open any file, as we reached FD limit ourselves.
 			continue
 		}
-		UserProcs[uid] += threads
-		TotalTasks += threads
+		// TODO: we need to check for uid=0, CAP_SYS_RESOURCE & CAP_SYS_ADMIN
+		// http://lxr.free-electrons.com/source/kernel/fork.c#L1529
+		// and error handling
+		l, _ := GetLimits(pid)
+		byUid[uid] += threads
+		t.pids = append(t.pids, Task{pid: pid, limits: l, UidMap: byUid})
+		t.total += threads
 	}
+	return t
 }
 
-func ProcTotalLimit() uint64 {
-	data, err := ioutil.ReadFile("/proc/sys/kernel/threads-max")
+func ReadAndTrim(file string) (string, error) {
+	data, err := ioutil.ReadFile(file)
 	if err != nil {
-		// we are in a big trouble if we can't get threads-max, so just panic right away
-		panic(err)
+		return "", err
 	}
-	threadsMax, err := strconv.ParseUint(strings.TrimSuffix(string(data), "\n"), 10, 64)
+	return strings.TrimSuffix(string(data), "\n"), nil
+}
 
-	if err != nil {
-		panic(err)
-	}
-	return threadsMax
+func CmdName(pid string) (string, error) {
+	return ReadAndTrim(filepath.Join("/proc", pid, "comm"))
 }
 
 func FileNr() (used, max uint64) {
-	data, err := ioutil.ReadFile("/proc/sys/fs/file-nr")
+	str, err := ReadAndTrim("/proc/sys/fs/file-nr")
 	if err != nil {
 		panic(err)
 	}
-	str := strings.TrimSuffix(string(data), "\n")
 	parsed := strings.Split(str, "\t")
 
 	used, err = strconv.ParseUint(parsed[0], 10, 64)
@@ -191,11 +243,11 @@ func FileNr() (used, max uint64) {
 }
 
 func FilePerProcMax() uint64 {
-	data, err := ioutil.ReadFile("/proc/sys/fs/nr_open")
+	str, err := ReadAndTrim("/proc/sys/fs/nr_open")
 	if err != nil {
 		panic(err)
 	}
-	x, err := strconv.ParseUint(strings.TrimSuffix(string(data), "\n"), 10, 64)
+	x, err := strconv.ParseUint(str, 10, 64)
 	if err != nil {
 		panic(err)
 	}
@@ -210,98 +262,51 @@ func main() {
 		flag.IntVar(&nLines, "n", 10, "Output N most loaded processes. Use -1 to list all.")
 		flag.Parse()
 	}
-	procs, err := filepath.Glob("/proc/[0-9]*")
-	if err != nil {
-		panic(err)
-	}
-	var pids []string
-	for _, p := range procs {
-		pids = append(pids, strings.Split(p, "/")[2])
-	}
 
-	// count number of processes per user
-	countProcesses(pids)
-	fmt.Printf("Tasks %d, system max is %d\n", TotalTasks, ProcTotalLimit())
-
+	// ************** POPULATE CODE ********************
+	tasks := TasksInit()
+	procTotalLimit := ProcTotalLimit()
 	fileTotal, fileMax := FileNr()
 	filePerProcMax := FilePerProcMax()
+	var out []OutputEntry
+	for _, pid := range tasks.pids {
+		m := []Metric{{name: "fds-rlim", f: pid.FdsRlim}, {name: "nproc-rlim", f: pid.NprocRlim}}
+		for i := 0; i < len(m); i++ {
+			//TODO: need error handling. What if we could not get FD limits, but got everything else?
+			e, _ := m[i].f.(func() (Entry, error))()
+			m[i].res = e
+		}
+		cmd, _ := CmdName(pid.pid)
+
+		adds := []Metric{{name: "threads-max", res: Entry{tasks.total, procTotalLimit}},
+			{name: "file-max", res: Entry{fileTotal, fileMax}},
+			{name: "file-perproc-max", res: Entry{m[0].res.v, filePerProcMax}}}
+		out = append(out, OutputEntry{pid.pid, m, CalcBound(append(m, adds...)), cmd})
+	}
+
+	// **************** PRINT CODE *********************
+	fmt.Printf("Tasks %d, system max is %d\n", tasks.total, procTotalLimit)
 	fmt.Printf("File descriptors open %d, system max total is %d, system max per process is %d\n", fileTotal, fileMax, filePerProcMax)
-
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 0, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(w, "PID\t FD\t FD-Rlim\t FD%\t Task\t Pr-Rlim\t Task%\t CMD\t")
+	fmt.Fprintln(w, "PID\t FD\t FD-RL\t TSK\t TSK-RL\t BOUND\t VAL\t MAX\t %USE\t CMD\t")
 
-	entries := []OutputEntry{}
-
-	for _, pid := range pids {
-		limits, err := GetLimits(pid)
-		if err != nil {
-			continue // this process may no longer exist. So let's skip it.
-		}
-		open, err := GetFdOpen(pid)
-		if err != nil {
-			continue // this process may no longer exist. So let's skip it.
-		}
-
-		fdsMaxPerProc := min(min(limits.openFiles.Cur, fileMax), filePerProcMax)
-		fdsPercent := float64(open) / float64(fdsMaxPerProc) * 100.0
-		if fdsPercent > 100 {
-			fdsPercent = 100
-		}
-
-		fdsLimit := "-1"
-		if limits.openFiles.Cur != math.MaxUint64 {
-			fdsLimit = strconv.FormatUint(limits.openFiles.Cur, 10)
-		}
-
-		nProc, err := GetNProcPerUid(pid)
-		if err != nil {
-			continue // this process may no longer exist. So let's skip it.
-		}
-		nProcLimit := min(limits.nProc.Cur, ProcTotalLimit())
-		pp := float64(nProc) / float64(nProcLimit) * 100.0
-		if pp > 100 {
-			pp = 100
-		}
-
-		// TODO: we need to check not just for uid=0, but also for CAP_SYS_RESOURCE & CAP_SYS_ADMIN
-		// http://lxr.free-electrons.com/source/kernel/fork.c#L1529
-		plStr := "-1"
-		if limits.nProc.Cur != math.MaxUint64 {
-			plStr = strconv.FormatUint(limits.nProc.Cur, 10)
-		}
-
-		cmd, err := CmdName(pid)
-		if err != nil {
-			continue // this process may no longer exist. So let's skip it.
-		}
-
-		entries = append(entries, OutputEntry{
-			pid:          pid,
-			cmd:          cmd,
-			fds:          open,
-			fdsLimit:     fdsLimit,
-			fdsPercent:   fdsPercent,
-			nProc:        nProc,
-			nProcLimit:   plStr,
-			nProcPercent: pp,
-		})
-	}
-
-	f := func(i, j int) bool {
-		return math.Max(entries[i].fdsPercent, entries[i].nProcPercent) > math.Max(entries[j].fdsPercent, entries[j].nProcPercent)
-	}
-	sort.Slice(entries, f)
-
+	sort.Slice(out, func(i, j int) bool { return out[i].bound.p > out[j].bound.p })
 	if nLines == -1 {
-		nLines = len(entries)
+		nLines = len(out)
 	}
-	for i := 0; i < nLines && i < len(entries); i++ {
-		e := entries[i]
-		fmt.Fprintf(w, "%s\t %d\t %s\t %2.1f\t %d\t %s\t %2.1f\t %s\t\n",
-			e.pid, e.fds, e.fdsLimit, e.fdsPercent, e.nProc, e.nProcLimit, e.nProcPercent, e.cmd)
+	for i := 0; i < nLines && i < len(out); i++ {
+		fmt.Fprintf(w, "%s\t", out[i].pid)
+		for j := 0; j < len(out[i].data); j++ {
+			maxS := "-1"
+			if out[i].data[j].res.max != math.MaxUint64 {
+				maxS = strconv.FormatUint(out[i].data[j].res.max, 10)
+			}
+			fmt.Fprintf(w, "%d\t %s\t ", out[i].data[j].res.v, maxS)
+		}
+		fmt.Fprintf(w, "%s\t %d\t %d\t %2.1f\t ", out[i].bound.by, out[i].bound.v, out[i].bound.max, out[i].bound.p)
+		fmt.Fprintf(w, "%s\t\n", out[i].cmd)
 	}
-	if err = w.Flush(); err != nil {
+	if err := w.Flush(); err != nil {
 		panic(err)
 	}
-
 }
