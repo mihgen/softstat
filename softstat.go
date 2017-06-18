@@ -12,63 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package softstat
 
 import (
-	"flag"
-	"fmt"
 	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"unsafe"
 )
-
-type Metric struct {
-	name string
-	f    interface{}
-	res  Entry
-}
 
 type Limits struct {
 	openFiles syscall.Rlimit
 	nProc     syscall.Rlimit
 }
 
-type Entry struct {
-	v   uint64
-	max uint64
-}
-
-type Boundary struct {
-	by  string
-	v   uint64
-	max uint64
-	p   float64
-}
-
-type OutputEntry struct {
-	pid   string
-	data  []Metric
-	bound Boundary
-	cmd   string
-}
-
 type Task struct {
-	pid    string
+	Pid    string
 	UidMap map[string]uint64
 	limits Limits
 }
 
 type Tasks struct {
-	pids  []Task
-	total uint64
+	Pids  []Task
+	Total uint64
+}
+
+type Entry struct {
+	V   uint64
+	Max uint64
 }
 
 func Prlimit(pid int, resource int, new_rlim *syscall.Rlimit, old_rlim *syscall.Rlimit) (err error) {
@@ -117,7 +93,7 @@ func countFiles(dir string) (uint64, error) {
 }
 
 func (t Task) FdsRlim() (Entry, error) {
-	v, err := countFiles(filepath.Join("/proc", t.pid, "fd"))
+	v, err := countFiles(filepath.Join("/proc", t.Pid, "fd"))
 	if err != nil {
 		return Entry{}, err // this process may no longer exist. So let's skip it.
 	}
@@ -125,30 +101,11 @@ func (t Task) FdsRlim() (Entry, error) {
 }
 
 func (t Task) NprocRlim() (Entry, error) {
-	uid, _, err := getStatus(t.pid)
+	uid, _, err := getStatus(t.Pid)
 	if err != nil {
 		return Entry{}, err
 	}
 	return Entry{t.UidMap[uid], t.limits.nProc.Cur}, nil
-}
-
-func CalcBound(m []Metric) (b Boundary) {
-	b.p = -1.0
-	for i := 0; i < len(m); i++ {
-		var p float64
-		if m[i].res.max <= 0 {
-			p = 100.0
-		} else {
-			p = 100.0 * float64(m[i].res.v) / float64(m[i].res.max)
-		}
-		if p > b.p {
-			b.p = p
-			b.by = m[i].name
-			b.v = m[i].res.v
-			b.max = m[i].res.max
-		}
-	}
-	return
 }
 
 func getStatus(pid string) (uid string, threads uint64, err error) {
@@ -173,7 +130,6 @@ func getStatus(pid string) (uid string, threads uint64, err error) {
 func ProcTotalLimit() uint64 {
 	str, err := ReadAndTrim("/proc/sys/kernel/threads-max")
 	if err != nil {
-		// we are in a big trouble if we can't get threads-max, so just panic right away
 		panic(err)
 	}
 	threadsMax, err := strconv.ParseUint(str, 10, 64)
@@ -181,6 +137,18 @@ func ProcTotalLimit() uint64 {
 		panic(err)
 	}
 	return threadsMax
+}
+
+func PidTotalLimit() uint64 {
+	str, err := ReadAndTrim("/proc/sys/kernel/pid_max")
+	if err != nil {
+		panic(err)
+	}
+	v, err := strconv.ParseUint(str, 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
 
 func TasksInit() *Tasks {
@@ -201,13 +169,17 @@ func TasksInit() *Tasks {
 			// One of issues could be that we simply can't open any file, as we reached FD limit ourselves.
 			continue
 		}
-		// TODO: we need to check for uid=0, CAP_SYS_RESOURCE & CAP_SYS_ADMIN
-		// http://lxr.free-electrons.com/source/kernel/fork.c#L1529
-		// and error handling
+		// TODO: error handling
 		l, _ := GetLimits(pid)
+		// User with uid=0 has no RLIMIT enforcement on number of tasks. threads-max is still applied though.
+		if uid == "0" {
+			// TODO: we need to check for CAP_SYS_RESOURCE & CAP_SYS_ADMIN too
+			// http://lxr.free-electrons.com/source/kernel/fork.c#L1529
+			l.nProc.Cur = math.MaxUint64
+		}
 		byUid[uid] += threads
-		t.pids = append(t.pids, Task{pid: pid, limits: l, UidMap: byUid})
-		t.total += threads
+		t.Pids = append(t.Pids, Task{Pid: pid, limits: l, UidMap: byUid})
+		t.Total += threads
 	}
 	return t
 }
@@ -252,61 +224,4 @@ func FilePerProcMax() uint64 {
 		panic(err)
 	}
 	return x
-}
-
-func main() {
-	var nLines int
-	if len(os.Args) == 2 && os.Args[1] == "-1" {
-		nLines = -1
-	} else {
-		flag.IntVar(&nLines, "n", 10, "Output N most loaded processes. Use -1 to list all.")
-		flag.Parse()
-	}
-
-	// ************** POPULATE CODE ********************
-	tasks := TasksInit()
-	procTotalLimit := ProcTotalLimit()
-	fileTotal, fileMax := FileNr()
-	filePerProcMax := FilePerProcMax()
-	var out []OutputEntry
-	for _, pid := range tasks.pids {
-		m := []Metric{{name: "fds-rlim", f: pid.FdsRlim}, {name: "nproc-rlim", f: pid.NprocRlim}}
-		for i := 0; i < len(m); i++ {
-			//TODO: need error handling. What if we could not get FD limits, but got everything else?
-			e, _ := m[i].f.(func() (Entry, error))()
-			m[i].res = e
-		}
-		cmd, _ := CmdName(pid.pid)
-
-		adds := []Metric{{name: "threads-max", res: Entry{tasks.total, procTotalLimit}},
-			{name: "file-max", res: Entry{fileTotal, fileMax}},
-			{name: "file-perproc-max", res: Entry{m[0].res.v, filePerProcMax}}}
-		out = append(out, OutputEntry{pid.pid, m, CalcBound(append(m, adds...)), cmd})
-	}
-
-	// **************** PRINT CODE *********************
-	fmt.Printf("Tasks %d, system max is %d\n", tasks.total, procTotalLimit)
-	fmt.Printf("File descriptors open %d, system max total is %d, system max per process is %d\n", fileTotal, fileMax, filePerProcMax)
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 0, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(w, "PID\t FD\t FD-RL\t TSK\t TSK-RL\t BOUND\t VAL\t MAX\t %USE\t CMD\t")
-
-	sort.Slice(out, func(i, j int) bool { return out[i].bound.p > out[j].bound.p })
-	if nLines == -1 {
-		nLines = len(out)
-	}
-	for i := 0; i < nLines && i < len(out); i++ {
-		fmt.Fprintf(w, "%s\t", out[i].pid)
-		for j := 0; j < len(out[i].data); j++ {
-			maxS := "-1"
-			if out[i].data[j].res.max != math.MaxUint64 {
-				maxS = strconv.FormatUint(out[i].data[j].res.max, 10)
-			}
-			fmt.Fprintf(w, "%d\t %s\t ", out[i].data[j].res.v, maxS)
-		}
-		fmt.Fprintf(w, "%s\t %d\t %d\t %2.1f\t ", out[i].bound.by, out[i].bound.v, out[i].bound.max, out[i].bound.p)
-		fmt.Fprintf(w, "%s\t\n", out[i].cmd)
-	}
-	if err := w.Flush(); err != nil {
-		panic(err)
-	}
 }
